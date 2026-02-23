@@ -106,8 +106,37 @@ def write_tf(writer, hmd_csv):
         writer.write_message("/tf", msg, log_time=ts, publish_time=ts)
 
 
-def first_timestamp_ns(folder, ext):
-    paths = sorted(folder.glob(f"*.{ext}"))
+def _frame_sort_key(path):
+    try:
+        return (0, int(path.stem))
+    except ValueError:
+        return (1, path.stem)
+
+
+def _collect_camera_frames(folder):
+    if not folder.exists():
+        return [], None
+
+    files = [p for p in folder.iterdir() if p.is_file()]
+    yuv_paths = sorted(
+        (p for p in files if p.suffix.lower() == ".yuv"),
+        key=_frame_sort_key,
+    )
+    if yuv_paths:
+        return yuv_paths, "yuv"
+
+    jpeg_paths = sorted(
+        (p for p in files if p.suffix.lower() in {".jpg", ".jpeg"}),
+        key=_frame_sort_key,
+    )
+    if jpeg_paths:
+        return jpeg_paths, "jpeg"
+
+    return [], None
+
+
+def first_timestamp_ns(folder):
+    paths, _ = _collect_camera_frames(folder)
     if not paths:
         return 0
     ts_ms = int(paths[0].stem)
@@ -140,54 +169,71 @@ def write_rgb(
     output_res,
     include_raw,
 ):
-    fmt = json.load(open(image_format_json))
-    width = int(fmt["width"])
-    height = int(fmt["height"])
-    y_row_stride = int(fmt["planes"][0]["rowStride"])
-    uv_row_stride = int(fmt["planes"][1]["rowStride"])
-    uv_pixel_stride = int(fmt["planes"][1]["pixelStride"])
-    y_plane_size = int(fmt["planes"][0]["bufferSize"])
-    u_plane_size = int(fmt["planes"][1]["bufferSize"])
-    v_plane_size = int(fmt["planes"][2]["bufferSize"])
+    frame_paths, frame_kind = _collect_camera_frames(folder)
+    if not frame_paths:
+        return
 
-    y_size = y_plane_size
-    uv_size = min(u_plane_size, v_plane_size)
-    uv_expected = uv_row_stride * (height // 2)
+    if frame_kind == "yuv":
+        fmt = json.load(open(image_format_json))
+        width = int(fmt["width"])
+        height = int(fmt["height"])
+        y_row_stride = int(fmt["planes"][0]["rowStride"])
+        uv_row_stride = int(fmt["planes"][1]["rowStride"])
+        uv_pixel_stride = int(fmt["planes"][1]["pixelStride"])
+        y_plane_size = int(fmt["planes"][0]["bufferSize"])
+        u_plane_size = int(fmt["planes"][1]["bufferSize"])
+        v_plane_size = int(fmt["planes"][2]["bufferSize"])
 
-    for fpath in sorted(folder.glob("*.yuv")):
+        y_size = y_plane_size
+        uv_size = min(u_plane_size, v_plane_size)
+        uv_expected = uv_row_stride * (height // 2)
+
+    for fpath in frame_paths:
         ts = ms_to_ns(fpath.stem)
+        source_jpeg_bytes = None
 
-        data = np.fromfile(fpath, np.uint8)
-        if data.size < y_size + 2 * uv_size:
-            continue
+        if frame_kind == "yuv":
+            data = np.fromfile(fpath, np.uint8)
+            if data.size < y_size + 2 * uv_size:
+                continue
 
-        y = data[:y_size].reshape((height, y_row_stride))[:, :width]
-        u_flat = data[y_size:y_size + uv_size]
-        v_flat = data[y_size + uv_size:y_size + 2 * uv_size]
-        if u_flat.size < uv_expected:
-            u_flat = np.pad(u_flat, (0, uv_expected - u_flat.size), mode="edge")
-        if v_flat.size < uv_expected:
-            v_flat = np.pad(v_flat, (0, uv_expected - v_flat.size), mode="edge")
-        u = u_flat.reshape((height // 2, uv_row_stride))
-        v = v_flat.reshape((height // 2, uv_row_stride))
+            y = data[:y_size].reshape((height, y_row_stride))[:, :width]
+            u_flat = data[y_size:y_size + uv_size]
+            v_flat = data[y_size + uv_size:y_size + 2 * uv_size]
+            if u_flat.size < uv_expected:
+                u_flat = np.pad(u_flat, (0, uv_expected - u_flat.size), mode="edge")
+            if v_flat.size < uv_expected:
+                v_flat = np.pad(v_flat, (0, uv_expected - v_flat.size), mode="edge")
+            u = u_flat.reshape((height // 2, uv_row_stride))
+            v = v_flat.reshape((height // 2, uv_row_stride))
 
-        if uv_pixel_stride == 2:
-            u = u[:, ::2]
-            v = v[:, ::2]
+            if uv_pixel_stride == 2:
+                u = u[:, ::2]
+                v = v[:, ::2]
+            else:
+                u = u[:, :width // 2]
+                v = v[:, :width // 2]
+
+            i420 = np.concatenate((y.flatten(), u.flatten(), v.flatten()))
+            i420 = i420.reshape((height * 3 // 2, width))
+            bgr = cv2.cvtColor(i420, cv2.COLOR_YUV2BGR_I420)
+            src_h, src_w = height, width
         else:
-            u = u[:, :width // 2]
-            v = v[:, :width // 2]
+            encoded = np.fromfile(fpath, np.uint8)
+            if encoded.size == 0:
+                continue
+            bgr = cv2.imdecode(encoded, cv2.IMREAD_COLOR)
+            if bgr is None:
+                continue
+            src_h, src_w = bgr.shape[:2]
+            source_jpeg_bytes = encoded.tobytes()
 
-        i420 = np.concatenate((y.flatten(), u.flatten(), v.flatten()))
-        i420 = i420.reshape((height * 3 // 2, width))
-        bgr = cv2.cvtColor(i420, cv2.COLOR_YUV2BGR_I420)
-
-        out_w, out_h = _parse_resolution(output_res, width, height)
-        if (out_w, out_h) != (width, height):
-            out_w, out_h = _fit_resolution(width, height, out_w, out_h)
+        out_w, out_h = _parse_resolution(output_res, src_w, src_h)
+        if (out_w, out_h) != (src_w, src_h):
+            out_w, out_h = _fit_resolution(src_w, src_h, out_w, out_h)
             bgr = cv2.resize(bgr, (out_w, out_h), interpolation=cv2.INTER_AREA)
         else:
-            out_w, out_h = width, height
+            out_w, out_h = src_w, src_h
 
         if include_raw and raw_topic:
             msg = RawImage(
@@ -202,12 +248,19 @@ def write_rgb(
             writer.write_message(raw_topic, msg, log_time=ts, publish_time=ts)
 
         if compressed_topic:
-            ok, buf = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, 90])
-            if ok:
+            compressed_data = None
+            if source_jpeg_bytes is not None and (out_w, out_h) == (src_w, src_h):
+                compressed_data = source_jpeg_bytes
+            else:
+                ok, buf = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, 90])
+                if ok:
+                    compressed_data = buf.tobytes()
+
+            if compressed_data is not None:
                 cmsg = CompressedImage(
                     frame_id=frame_id,
                     format="jpeg",
-                    data=buf.tobytes(),
+                    data=compressed_data,
                 )
                 set_timestamp(cmsg, ts)
                 writer.write_message(compressed_topic, cmsg, log_time=ts, publish_time=ts)
@@ -332,8 +385,8 @@ def main():
         # write_depth(writer, data_dir / "left_depth", "/depth/left/image", 320)
         # write_depth(writer, data_dir / "right_depth", "/depth/right/image", 320)
 
-        left_calib_ts = first_timestamp_ns(data_dir / "left_camera_raw", "yuv")
-        right_calib_ts = first_timestamp_ns(data_dir / "right_camera_raw", "yuv")
+        left_calib_ts = first_timestamp_ns(data_dir / "left_camera_raw")
+        right_calib_ts = first_timestamp_ns(data_dir / "right_camera_raw")
         write_calib(
             writer,
             data_dir / "left_camera_characteristics.json",
